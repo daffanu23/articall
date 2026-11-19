@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Articall – Layout Carousel Berita Instan</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">Articall<span>Carousel berita 1080×1350</span></div>
+  <div class="actions">
+    <button id="dlOne" class="btn">Halaman Ini</button>
+    <button id="dlAll" class="btn primary">Download Semua</button>
+  </div>
+</header>
+
+<main class="app">
+  <!-- Kiri: kontrol -->
+  <aside class="panel" id="controls">
+    <section>
+      <h2>Pilih Halaman</h2>
+      <select id="layout">
+        <option value="cover">Cover (Foto Penuh + Judul)</option>
+        <option value="split">Isi Berita (Foto Atas + Teks)</option>
+        <option value="text">Isi Berita (Teks Saja)</option>
+        <option value="quote">Kutipan / Quote</option>
+        <option value="closing">Penutup (CTA / QR)</option>
+      </select>
+    </section>
+
+    <section>
+      <h2>Teks</h2>
+      <label>Label / Kategori <input id="kicker" type="text" placeholder="BERITA UTAMA"></label>
+      <label>Judul <textarea id="title" rows="2" placeholder="Judul berita"></textarea></label>
+      <label>Isi / Kutipan <textarea id="body" rows="5" placeholder="Isi berita..."></textarea></label>
+      <label>Sumber / Penulis <input id="credit" type="text" placeholder="Teks: Nama · Foto: Nama"></label>
+    </section>
+
+    <section id="imgSec">
+      <h2>Gambar</h2>
+      <label>Unggah gambar <input id="image" type="file" accept="image/*"></label>
+      <label>Zoom <input id="zoom" type="range" min="1" max="3" step="0.01" value="1"></label>
+      <label>Horiz <input id="px" type="range" min="-100" max="100" value="0"></label>
+      <label>Vertikal <input id="py" type="range" min="-100" max="100" value="0"></label>
+      <label id="qrRow" hidden>Gambar QR (opsional) <input id="qr" type="file" accept="image/*"></label>
+    </section>
+
+    <section>
+      <h2>Keterbacaan</h2>
+      <label>Ketebalan Gradasi <output id="gradOut">70%</output>
+        <input id="grad" type="range" min="0" max="85" value="70"></label>
+    </section>
+
+    <section>
+      <h2>Branding <small>(berlaku semua halaman)</small></h2>
+      <label class="row"><input id="showLogo" type="checkbox" checked> Tampilkan Logo</label>
+      <label>Unggah logo <input id="logo" type="file" accept="image/*"></label>
+      <label>Posisi logo (terkunci)
+        <select id="logoPos">
+          <option value="tl">Kiri Atas</option>
+          <option value="tr">Kanan Atas</option>
+          <option value="bl">Kiri Bawah</option>
+          <option value="br">Kanan Bawah</option>
+        </select></label>
+      <label>Template
+        <select id="template">
+          <option value="modern">Modern Gelap</option>
+          <option value="koran">Klasik Koran</option>
+          <option value="minimal">Minimal Terang</option>
+          <option value="poster">Bold Poster</option>
+        </select></label>
+      <label>Nama redaksi <input id="brand" type="text" placeholder="@namamedia"></label>
+      <label>Warna aksen <input id="accent" type="color" value="#e63946"></label>
+      <label>Format unduhan
+        <select id="fmt"><option value="jpeg">JPG</option><option value="png">PNG</option></select></label>
+    </section>
+  </aside>
+
+  <!-- Tengah: preview -->
+  <section class="stage">
+    <div class="canvas-wrap"><canvas id="cv" width="1080" height="1350"></canvas></div>
+    <p class="hint">Live preview 1080×1350 px — hasil unduhan sama persis.</p>
+  </section>
+
+  <!-- Kanan: daftar slide -->
+  <aside class="panel slides">
+    <h2>Halaman</h2>
+    <ol id="slideList"></ol>
+    <div class="row-btns">
+      <button id="add" class="btn">+ Tambah</button>
+      <button id="dup" class="btn">Duplikat</button>
+      <button id="del" class="btn danger">Hapus</button>
+    </div>
+    <div class="row-btns">
+      <button id="up" class="btn">↑</button>
+      <button id="down" class="btn">↓</button>
+    </div>
+  </aside>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
