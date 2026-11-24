@@ -239,7 +239,7 @@ function isiKutipan(r: R) {
   const sub = hasImg ? overlaySub(r, '#d6dbe3') : P.sub;
   c.fillStyle = P.accent; c.font = font(900, 300, SERIF); c.textAlign = 'left'; c.textBaseline = 'alphabetic';
   c.fillText('“', PAD - 8, top + 210);
-  const q = block(r, s.body, fBody(r, 'italic 600', 56), 56, 1.35, TW, 10);
+  const q = block(r, s.body, fBody(r, 'italic 600', 56), 56, 1.35, TW, 8);
   let y = top + 250;
   draw(r, q, PAD, y, fg); y += q.h + 30;
   c.fillStyle = P.accent; c.fillRect(PAD, y, 90, 6); y += 34;

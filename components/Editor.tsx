@@ -6,6 +6,9 @@ import {
 import { CustomPaletteColors, PALETTES, autoTextForBg, getPalette } from '@/lib/palettes';
 import { renderSlide } from '@/lib/render';
 import { Fmt, downloadAll, downloadOne } from '@/lib/export';
+import {
+  AiMode, GeneratedCarouselPlan, SAMPLE_NEWS_ARTICLE, SlideCountMode, VerbatimLayoutStyle, WordCountMode, planToSlides,
+} from '@/lib/autoLayout';
 
 type Tab = 'template' | 'isi' | 'gaya';
 const TABS: { id: Tab; n: number; label: string }[] = [
@@ -95,10 +98,26 @@ export default function Editor() {
   const [toast, setToast] = useState('');
   const [over, setOver] = useState(false);
   const [rev, setRev] = useState(0);
+
+  // Alur 2 tahap: 1) Chatbox input artikel -> 2) Editor kustomisasi
+  const [stage, setStage] = useState<'chatbox' | 'editor'>('chatbox');
+  const [aiMode, setAiMode] = useState<AiMode>('verbatim');
+  const [articleText, setArticleText] = useState('');
+  const [aiSlideCount, setAiSlideCount] = useState<SlideCountMode>('auto');
+  const [aiWordCount, setAiWordCount] = useState<WordCountMode>('sedang');
+  const [aiInstruction, setAiInstruction] = useState('');
+  const [layoutStyle, setLayoutStyle] = useState<VerbatimLayoutStyle>('varied');
+  const [igHandle, setIgHandle] = useState('@akunmedia');
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiError, setAiError] = useState('');
+  const [aiNeedsKey, setAiNeedsKey] = useState(false);
+  const [aiNote, setAiNote] = useState('');
+
   const cvRef = useRef<HTMLCanvasElement>(null);
   const fontFileRef = useRef<HTMLInputElement>(null);
   const rafRef = useRef<number | null>(null);
   const pendingColorRef = useRef<{ idx: number; patch: Partial<CustomPaletteColors> } | null>(null);
+
   const s = slides[cur];
   const tpl = getTemplate(s.type, s.template);
   const has = (f: string) => tpl.fields.includes(f as never);
@@ -119,7 +138,7 @@ export default function Editor() {
       return { ...x, ...p, byType: { ...x.byType, [x.type]: nextFields } };
     })), [cur]);
   const patchBrand = (p: Partial<Brand>) => setBrand(b => ({ ...b, ...p }));
-  const say = (m: string) => { setToast(m); setTimeout(() => setToast(''), 2500); };
+  const say = useCallback((m: string) => { setToast(m); setTimeout(() => setToast(''), 2800); }, []);
 
   const setCustomColor = (patchColors: Partial<CustomPaletteColors>, immediate = false) => {
     if (pendingColorRef.current && pendingColorRef.current.idx === cur) {
@@ -169,13 +188,15 @@ export default function Editor() {
   }, []);
 
   useEffect(() => {
-    setOver(renderSlide(cvRef.current!.getContext('2d')!, s, brand).over);
-  }, [s, brand, rev]);
+    if (stage !== 'editor' || !cvRef.current) return;
+    setOver(renderSlide(cvRef.current.getContext('2d')!, s, brand).over);
+  }, [s, brand, rev, stage]);
   useEffect(() => { document.fonts?.ready.then(() => setRev(r => r + 1)); }, []);
 
-  // Panah kiri/kanan = pindah halaman (kecuali sedang mengetik)
+  // Panah kiri/kanan = pindah halaman (kecuali sedang mengetik atau di chatbox)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (stage !== 'editor') return;
       const t = e.target as HTMLElement;
       if (/INPUT|TEXTAREA|SELECT/.test(t.tagName)) return;
       if (e.key === 'ArrowLeft') setCur(c => Math.max(0, c - 1));
@@ -183,7 +204,7 @@ export default function Editor() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [slides.length]);
+  }, [slides.length, stage]);
 
   const changeType = (type: PageType) => {
     if (s.type === type) return;
@@ -292,12 +313,185 @@ export default function Editor() {
     try { await fn(); say(ok); } catch { say('Gagal mengunduh, coba lagi.'); } finally { setBusy(false); }
   };
 
+  const generateFromArticle = async (useFallback = false) => {
+    if (!articleText.trim()) {
+      setAiError('Tempelkan atau ketik artikel terlebih dahulu.');
+      return;
+    }
+    setAiError('');
+    setAiNeedsKey(false);
+    setAiNote('');
+    setAiBusy(true);
+    try {
+      const penutupHandle = igHandle.trim() || slides.find(x => x.type === 'penutup')?.handle || '@akunmedia';
+      const res = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: articleText,
+          article: articleText,
+          mode: aiMode,
+          slideCount: aiSlideCount,
+          wordCount: aiWordCount,
+          context: aiInstruction,
+          instruction: aiInstruction,
+          layoutStyle,
+          handle: penutupHandle,
+          useFallback,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.plan) {
+        if (data?.needsKey) setAiNeedsKey(true);
+        throw new Error(data.error || 'Gagal memproses artikel.');
+      }
+      const plan = data.plan as GeneratedCarouselPlan;
+      const nextSlides = planToSlides(plan, s);
+      setSlides(nextSlides);
+      setCur(0);
+      if (data.warning) setAiNote(data.warning);
+      setStage('editor');
+      say(
+        data.source === 'fallback'
+          ? `${nextSlides.length} halaman dibuat (simulasi lokal) — silakan kustomisasi`
+          : `${nextSlides.length} halaman berhasil di-layout otomatis — silakan kustomisasi`,
+      );
+    } catch (err) {
+      setAiError(err instanceof Error ? err.message : 'Terjadi kesalahan saat memproses artikel.');
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
+  if (stage === 'chatbox') {
+    return (
+      <>
+        <main className="onboard">
+          <nav className="onboard-nav">
+            <span className="brand">Articall</span>
+            <button className="btn" onClick={() => setStage('editor')}>Lewati ke Editor Manual →</button>
+          </nav>
+
+          <section className="onboard-hero">
+            <h1>Ubah Artikel Berita Jadi Carousel Instagram Otomatis</h1>
+            <p>Tempel naskah berita Anda, pilih mode pemrosesan, lalu kustomisasi template, warna, font, dan download siap unggah.</p>
+            <div className="steps-row">
+              <span className="on">1. Tempel Artikel</span>
+              <span>2. Auto-Layout</span>
+              <span>3. Kustomisasi &amp; Download</span>
+            </div>
+          </section>
+
+          <section className="chatbox-card">
+            <div className="mode-grid">
+              <button className={aiMode === 'verbatim' ? 'mode-card on' : 'mode-card'} onClick={() => setAiMode('verbatim')}>
+                <b>Mode 1 · Teks Asli (Tanpa Intervensi AI)</b>
+                <span>Teks sama persis 100% dengan artikel Anda, otomatis dipecah per halaman &amp; di-layout.</span>
+              </button>
+              <button className={aiMode === 'ai' ? 'mode-card on' : 'mode-card'} onClick={() => setAiMode('ai')}>
+                <b>Mode 2 · Olah Penuh Gemini AI</b>
+                <span>Diolah oleh Gemini AI menjadi narasi carousel IG, subjudul, kutipan, variasi layout, &amp; caption.</span>
+              </button>
+            </div>
+
+            <div className="article-head">
+              <span className="field-label">Naskah Artikel Berita</span>
+              <div className="pal-actions">
+                <button className="btn small" onClick={() => setArticleText(SAMPLE_NEWS_ARTICLE)}>📋 Isi Contoh Artikel Berita</button>
+                <button className="btn small" onClick={() => setArticleText('')}>Bersihkan</button>
+              </div>
+            </div>
+            <textarea
+              rows={9}
+              value={articleText}
+              placeholder="Tempel artikel berita lengkap di sini (baris pertama bisa berupa judul berita)..."
+              onChange={e => setArticleText(e.target.value)}
+            />
+
+            {aiMode === 'verbatim' ? (
+              <div className="chatbox-opts">
+                <label className="f">
+                  <span className="field-label">Gaya Auto-Layout Mode 1</span>
+                  <select value={layoutStyle} onChange={e => setLayoutStyle(e.target.value as VerbatimLayoutStyle)}>
+                    <option value="varied">Variasi Semua Layout (Foto Atas, Teks, Panel, Dua Kolom)</option>
+                    <option value="text-focused">Fokus Teks Penuh (Teks Saja &amp; Dua Kolom)</option>
+                  </select>
+                </label>
+                <label className="f">
+                  <span className="field-label">Akun Media Sosial (Penutup)</span>
+                  <input type="text" value={igHandle} placeholder="@akunmedia" onChange={e => setIgHandle(e.target.value)} />
+                </label>
+              </div>
+            ) : (
+              <div className="ai-opts">
+                <div className="ai-selects">
+                  <label className="f">
+                    <span className="field-label">Target Jumlah Slide (Isi)</span>
+                    <select value={aiSlideCount} onChange={e => setAiSlideCount(e.target.value as SlideCountMode)}>
+                      <option value="auto">Auto (Disesuaikan AI)</option>
+                      <option value="2">2 Slide</option>
+                      <option value="3">3 Slide</option>
+                      <option value="4">4 Slide</option>
+                      <option value="5">5 Slide</option>
+                      <option value="6">6 Slide</option>
+                    </select>
+                  </label>
+                  <label className="f">
+                    <span className="field-label">Kepadatan Teks per Slide</span>
+                    <select value={aiWordCount} onChange={e => setAiWordCount(e.target.value as WordCountMode)}>
+                      <option value="singkat">Singkat (20–30 kata)</option>
+                      <option value="sedang">Sedang (40–50 kata)</option>
+                      <option value="panjang">Panjang (60–80 kata)</option>
+                    </select>
+                  </label>
+                  <label className="f">
+                    <span className="field-label">Akun Media Sosial</span>
+                    <input type="text" value={igHandle} placeholder="@akunmedia" onChange={e => setIgHandle(e.target.value)} />
+                  </label>
+                </div>
+                <label className="f">
+                  <span className="field-label">Konteks / Sudut Pandang Tambahan (Opsional)</span>
+                  <textarea
+                    rows={2}
+                    value={aiInstruction}
+                    placeholder="Contoh: Buat dengan gaya bahasa Gen-Z yang santai, atau fokuskan pada dampak ekonomi..."
+                    onChange={e => setAiInstruction(e.target.value)}
+                  />
+                </label>
+              </div>
+            )}
+
+            {aiNote && <p className="tip" style={{ marginTop: 10 }}>{aiNote}</p>}
+            {aiError && (
+              <div className="warn" style={{ marginTop: 10 }}>
+                <p style={{ margin: 0 }}>⚠ {aiError}</p>
+                {aiNeedsKey && (
+                  <button className="btn small" style={{ marginTop: 8 }} onClick={() => generateFromArticle(true)}>
+                    Gunakan Simulasi Lokal (Tanpa API Key)
+                  </button>
+                )}
+              </div>
+            )}
+
+            <div className="chatbox-foot">
+              <button className="btn primary big-cta" disabled={aiBusy} onClick={() => generateFromArticle(false)}>
+                {aiBusy ? 'AI Sedang Bekerja…' : '✨ Proses Artikel & Buat Layout Carousel →'}
+              </button>
+            </div>
+          </section>
+        </main>
+        {toast && <div className="toast" role="status">{toast}</div>}
+      </>
+    );
+  }
+
   return (
     <>
       <header className="top">
         <a className="brand" href="/">Articall</a>
         <span className="crumb">Halaman {cur + 1} dari {slides.length}</span>
         <div className="actions">
+          <button className="btn ai-btn" onClick={() => setStage('chatbox')}>← Artikel Baru</button>
           <select className="fmt" value={fmt} onChange={e => setFmt(e.target.value as Fmt)} aria-label="Format unduhan">
             <option value="jpeg">JPG</option><option value="png">PNG</option>
           </select>
@@ -345,6 +539,9 @@ export default function Editor() {
 
           <div className="tab-body">
             {tab === 'template' && (<>
+              <button className="ai-banner" onClick={() => setStage('chatbox')}>
+                ← Ganti / Proses Artikel Baru <b>Buka Chatbox →</b>
+              </button>
               <section>
                 <h2>Jenis halaman</h2>
                 <div className="seg">
@@ -569,6 +766,7 @@ export default function Editor() {
           </div>
         </aside>
       </main>
+
       {toast && <div className="toast" role="status">{toast}</div>}
     </>
   );

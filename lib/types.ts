@@ -90,7 +90,7 @@ export const PAGE_TYPE_BADGE: Record<PageType, string> = {
   penutup: 'Penutup',
 };
 
-export const CREDIT_ROLES = ['Penulis', 'Foto', 'Editor', 'Reporter', 'Ilustrasi', 'Sumber'];
+export const CREDIT_ROLES = ['Penulis', 'Penyunting', 'Layouter', 'Editor', 'Foto', 'Reporter', 'Ilustrasi', 'Sumber'];
 
 export const TEMPLATES: Record<PageType, TemplateDef[]> = {
   cover: [
