@@ -11,6 +11,38 @@ export type AiMode = 'verbatim' | 'ai';
 export type VerbatimLayoutStyle = 'varied' | 'text-focused';
 export type SlideCountMode = 'auto' | '2' | '3' | '4' | '5' | '6';
 export type WordCountMode = 'singkat' | 'sedang' | 'panjang';
+export type ProgressStepId = 'validate' | 'connect' | 'streaming' | 'layout' | 'done';
+
+export interface StreamPreviewState {
+  kicker?: string;
+  cover?: string;
+  slides: { title: string; template: string }[];
+  hasOutro?: boolean;
+}
+
+export type GenerateStreamEvent =
+  | {
+      type: 'progress';
+      step: ProgressStepId;
+      percent: number;
+      message: string;
+      log?: string;
+      elapsedMs: number;
+      preview?: StreamPreviewState;
+    }
+  | {
+      type: 'result';
+      plan: GeneratedCarouselPlan;
+      source: 'verbatim' | 'gemini' | 'fallback';
+      modelUsed?: string;
+      durationMs: number;
+    }
+  | {
+      type: 'error';
+      error: string;
+      needsKey?: boolean;
+      elapsedMs: number;
+    };
 
 export interface GeneratedCarouselPlan {
   cover: {

@@ -1,11 +1,13 @@
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
-import { generateObject } from 'ai';
+import { generateObject, streamObject } from 'ai';
 import { z } from 'zod';
 import { NextResponse } from 'next/server';
 import {
   AiMode,
+  GenerateStreamEvent,
   GeneratedCarouselPlan,
   SlideCountMode,
+  StreamPreviewState,
   VerbatimLayoutStyle,
   WordCountMode,
   buildLocalAiPlan,
@@ -14,6 +16,8 @@ import {
   extractArticleCredits,
   normalizeCreditRole,
 } from '@/lib/autoLayout';
+
+export const maxDuration = 60;
 
 function getMediaSchema(slideCount: SlideCountMode, wordCount: WordCountMode) {
   const slideInstruction =
@@ -99,6 +103,8 @@ function getMediaSchema(slideCount: SlideCountMode, wordCount: WordCountMode) {
   });
 }
 
+type MediaSchemaOut = z.infer<ReturnType<typeof getMediaSchema>>;
+
 const SYSTEM_PROMPT = `Kamu adalah Editor Senior Media Sosial yang merangkum artikel berita menjadi Carousel Instagram 1080x1350 yang rapi, faktual, dan mudah dibaca.
 
 ATURAN 1 — GROUNDING (ANTI-HALUSINASI):
@@ -125,7 +131,6 @@ ATURAN 4 — KESESUAIAN PANJANG TEKS DENGAN KANVAS:
   * Pilih template isi yang kapasitasnya cukup untuk panjang teksnya (teks panjang -> "teks" atau "dua-kolom").
 - Improvisasi sederhana saja: susun alur antar-slide mengalir alami (inti berita -> detail/fakta -> kutipan langsung jika ada -> dinamika/respons -> penutup) tanpa mengulang fakta yang sama.`;
 
-// Model resmi sesuai konfigurasi project Articall original
 const MODELS = ['gemini-3.8-flash', 'gemini-3.5-flash-lite'] as const;
 
 const cleanBreak = (str: string) => str.replace(/<br\s*\/?>/gi, '\n').trim();
@@ -138,56 +143,106 @@ function clampText(text: string, maxChars: number): string {
   return `${(sp > maxChars * 0.5 ? cut.slice(0, sp) : cut).trimEnd()}…`;
 }
 
+function formatFriendlyError(rawMessage: string): string {
+  if (rawMessage.includes('503') || rawMessage.includes('high demand') || rawMessage.includes('UNAVAILABLE')) {
+    return 'Server AI Google sedang sibuk (overload). Silakan tunggu 30 detik lalu coba lagi.';
+  }
+  if (rawMessage.includes('401') || rawMessage.includes('API key') || rawMessage.includes('API_KEY_INVALID')) {
+    return 'API Key tidak valid. Periksa kembali file .env.local Anda.';
+  }
+  return rawMessage || 'Terjadi kesalahan saat memproses dengan AI.';
+}
+
+function buildFinalPrompt(prompt: string, context: string): string {
+  let finalPrompt = `${SYSTEM_PROMPT}\n\n`;
+  if (context && context.trim() !== '') {
+    finalPrompt += `SUDUT PANDANG / KONTEKS TAMBAHAN DARI USER:\n"${context.trim()}"\n\n(Tulis rangkuman berita ini dengan menyesuaikan sudut pandang/konteks di atas tanpa melanggar aturan grounding).\n\n`;
+  }
+  finalPrompt += `Berikut adalah teks beritanya:\n"${prompt}"`;
+  return finalPrompt;
+}
+
+function assemblePlanFromAi(
+  aiOut: MediaSchemaOut,
+  rawPrompt: string,
+  handle: string,
+): { plan: GeneratedCarouselPlan; upgradedCount: number; creditCount: number } {
+  const { credits: parsedCredits } = extractArticleCredits(rawPrompt);
+  const aiCredits = (aiOut.credits ?? [])
+    .map(c => ({ role: normalizeCreditRole(c.role), name: c.name.trim() }))
+    .filter(c => c.name && !/^(tim redaksi|meja berita|redaksi|dokumentasi)$/i.test(c.name));
+
+  const mergedCredits = [...parsedCredits];
+  for (const ac of aiCredits) {
+    if (!mergedCredits.some(c => c.role === ac.role && c.name.toLowerCase() === ac.name.toLowerCase())) {
+      mergedCredits.push(ac);
+    }
+  }
+
+  let upgradedCount = 0;
+  const slides = aiOut.contents.map(item => {
+    const fitted = ensureSlideFitsTemplate({
+      title: cleanBreak(item.title),
+      body: cleanBreak(item.body),
+      template: item.template,
+    });
+    if (fitted.template !== item.template) upgradedCount++;
+    return fitted;
+  });
+
+  const finalCredits = mergedCredits.slice(0, 4);
+  return {
+    upgradedCount,
+    creditCount: finalCredits.length,
+    plan: {
+      cover: {
+        kicker: (aiOut.kicker || 'BERITA UTAMA').toUpperCase().slice(0, 26),
+        title: clampText(aiOut.cover, 72),
+        template: aiOut.coverTemplate,
+        credits: finalCredits,
+      },
+      slides,
+      penutup: {
+        title: clampText(aiOut.outroTitle || 'Baca Selengkapnya', 42),
+        body: clampText(aiOut.outro, 105),
+        handle,
+        template: aiOut.outroTemplate,
+      },
+    },
+  };
+}
+
 async function tryGenerate(
   apiKey: string,
   prompt: string,
   slideCount: SlideCountMode,
   wordCount: WordCountMode,
   context: string,
-) {
+): Promise<{ object: MediaSchemaOut; modelUsed: string }> {
   let lastError: unknown = null;
   const currentSchema = getMediaSchema(slideCount, wordCount);
   const google = createGoogleGenerativeAI({ apiKey });
-
-  let finalPrompt = `${SYSTEM_PROMPT}\n\n`;
-  if (context && context.trim() !== '') {
-    finalPrompt += `SUDUT PANDANG / KONTEKS TAMBAHAN DARI USER:\n"${context.trim()}"\n\n(Tulis rangkuman berita ini dengan menyesuaikan sudut pandang/konteks di atas tanpa melanggar aturan grounding).\n\n`;
-  }
-  finalPrompt += `Berikut adalah teks beritanya:\n"${prompt}"`;
+  const finalPrompt = buildFinalPrompt(prompt, context);
 
   for (const modelName of MODELS) {
     try {
-      console.log(`Trying model: ${modelName} with slideCount: ${slideCount}, wordCount: ${wordCount}...`);
-
       const result = await generateObject({
         model: google(modelName),
         schema: currentSchema,
         prompt: finalPrompt,
         temperature: 0.5,
       });
-
-      console.log(`Success with model: ${modelName}`);
-      return result.object;
+      return { object: result.object, modelUsed: modelName };
     } catch (error: unknown) {
-      const err = error as { message?: string; status?: number; statusCode?: number; data?: { error?: { code?: number } } };
-      console.warn(`Model ${modelName} failed:`, err?.message || 'Unknown error');
+      const err = error as { status?: number; statusCode?: number; data?: { error?: { code?: number } } };
       lastError = error;
-
-      // Jika error 401 (API key salah), langsung lempar tanpa coba yang lain
       const status = err?.status || err?.statusCode || err?.data?.error?.code;
-      if (status === 401) {
-        throw error;
-      }
-
-      // Tunggu sebentar sebelum coba model berikutnya
+      if (status === 401) throw error;
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
   }
 
-  // Jika kedua model gagal, coba sekali lagi dengan model kedua (flash-lite)
-  console.log('All models failed. Retrying with gemini-3.5-flash-lite after 2s delay...');
   await new Promise(resolve => setTimeout(resolve, 2000));
-
   try {
     const result = await generateObject({
       model: google('gemini-3.5-flash-lite'),
@@ -195,10 +250,172 @@ async function tryGenerate(
       prompt: finalPrompt,
       temperature: 0.5,
     });
-    return result.object;
+    return { object: result.object, modelUsed: 'gemini-3.5-flash-lite' };
   } catch (finalError) {
     throw lastError || finalError;
   }
+}
+
+async function tryStreamGenerate(
+  apiKey: string,
+  prompt: string,
+  slideCount: SlideCountMode,
+  wordCount: WordCountMode,
+  context: string,
+  emit: (ev: Omit<Extract<GenerateStreamEvent, { type: 'progress' }>, 'type' | 'elapsedMs'>) => void,
+): Promise<{ object: MediaSchemaOut; modelUsed: string }> {
+  let lastError: unknown = null;
+  const currentSchema = getMediaSchema(slideCount, wordCount);
+  const google = createGoogleGenerativeAI({ apiKey });
+  const finalPrompt = buildFinalPrompt(prompt, context);
+  const expectedSlides = slideCount === 'auto' ? 4 : parseInt(slideCount, 10);
+
+  const attemptModels: string[] = [...MODELS, 'gemini-3.5-flash-lite'];
+
+  for (let attempt = 0; attempt < attemptModels.length; attempt++) {
+    const modelName = attemptModels[attempt];
+    const isFinalRetry = attempt === attemptModels.length - 1;
+
+    emit({
+      step: 'connect',
+      percent: 24,
+      message: isFinalRetry
+        ? `Percobaan ulang ke model ${modelName}…`
+        : `Menghubungi Google Gemini (${modelName})…`,
+      log: isFinalRetry
+        ? `Retry akhir menggunakan ${modelName} setelah jeda pemulihan 2 detik…`
+        : `Mengirim prompt + skema Zod ke ${modelName} (slide: ${slideCount}, kepadatan: ${wordCount}, grounding: aktif)…`,
+    });
+
+    try {
+      const streamRes = streamObject({
+        model: google(modelName),
+        schema: currentSchema,
+        prompt: finalPrompt,
+        temperature: 0.5,
+      });
+
+      let loggedCover = false;
+      const loggedSlides = new Set<number>();
+      let loggedOutro = false;
+      let lastEmitTime = 0;
+
+      for await (const part of streamRes.fullStream) {
+        if (part.type === 'error') {
+          throw part.error;
+        }
+
+        if (part.type === 'object') {
+          const p = part.object;
+          const rawContents = Array.isArray(p.contents) ? p.contents : [];
+          const preview: StreamPreviewState = {
+            kicker: p.kicker ? String(p.kicker) : undefined,
+            cover: p.cover ? cleanBreak(String(p.cover)).replace(/\n/g, ' ') : undefined,
+            slides: rawContents
+              .filter((it): it is NonNullable<typeof it> => Boolean(it && (it.title || it.body)))
+              .map(it => ({
+                title: it.title ? cleanBreak(String(it.title)) : 'Menyusun subjudul…',
+                template: it.template ? String(it.template) : '…',
+              })),
+            hasOutro: Boolean(p.outro),
+          };
+
+          const curCount = preview.slides.length;
+          const pct = p.outro
+            ? 88
+            : curCount > 0
+              ? Math.min(84, 38 + Math.round((curCount / Math.max(1, expectedSlides)) * 44))
+              : p.cover
+                ? 34
+                : 28;
+
+          let milestoneLog: string | undefined;
+
+          if (!loggedCover && p.cover && rawContents.length > 0) {
+            loggedCover = true;
+            milestoneLog = `✓ Cover dirumuskan [${p.coverTemplate || 'foto-bawah'}]: "${cleanBreak(String(p.cover)).replace(/\n/g, ' ')}"`;
+          }
+
+          if (!milestoneLog) {
+            for (let i = 0; i < rawContents.length; i++) {
+              const item = rawContents[i];
+              const nextStarted = i + 1 < rawContents.length || Boolean(p.outroTitle || p.outro);
+              if (!loggedSlides.has(i) && item && item.body && item.template && nextStarted) {
+                loggedSlides.add(i);
+                const wCount = String(item.body).trim().split(/\s+/).filter(Boolean).length;
+                milestoneLog = `✓ Slide Isi #${i + 1} selesai [${item.template}] — "${cleanBreak(String(item.title || 'Tanpa subjudul'))}" (${wCount} kata)`;
+                break;
+              }
+            }
+          }
+
+          if (!milestoneLog && !loggedOutro && p.outro && p.outroTemplate) {
+            loggedOutro = true;
+            milestoneLog = `✓ Halaman Penutup selesai [${p.outroTemplate}]`;
+          }
+
+          const now = Date.now();
+          if (milestoneLog || now - lastEmitTime >= 150) {
+            lastEmitTime = now;
+            const activeMsg = p.outro
+              ? 'Merampungkan halaman penutup…'
+              : curCount > 0
+                ? `Menyusun Slide Isi #${curCount} secara real-time…`
+                : p.cover
+                  ? 'Merumuskan judul cover utama…'
+                  : `Menerima aliran token dari ${modelName}…`;
+
+            emit({
+              step: 'streaming',
+              percent: pct,
+              message: activeMsg,
+              log: milestoneLog,
+              preview,
+            });
+          }
+        }
+
+        if (part.type === 'finish') {
+          const inTok = part.usage?.inputTokens;
+          const outTok = part.usage?.outputTokens;
+          if (inTok !== undefined || outTok !== undefined) {
+            emit({
+              step: 'streaming',
+              percent: 90,
+              message: 'Validasi skema JSON selesai…',
+              log: `Token terpakai (${modelName}): input ${inTok ?? '-'} · output ${outTok ?? '-'} token.`,
+            });
+          }
+        }
+      }
+
+      const finalObject = await streamRes.object;
+      return { object: finalObject, modelUsed: modelName };
+    } catch (error: unknown) {
+      const err = error as { message?: string; status?: number; statusCode?: number; data?: { error?: { code?: number } } };
+      lastError = error;
+      const msg = err?.message || 'Unknown error';
+      const status = err?.status || err?.statusCode || err?.data?.error?.code;
+
+      if (status === 401 || msg.includes('401') || msg.includes('API_KEY_INVALID') || msg.includes('API key')) {
+        throw error;
+      }
+
+      if (attempt < attemptModels.length - 1) {
+        const nextModel = attemptModels[attempt + 1];
+        const waitMs = attempt === attemptModels.length - 2 ? 2000 : 1000;
+        emit({
+          step: 'connect',
+          percent: 22,
+          message: `Model ${modelName} sibuk, beralih ke ${nextModel}…`,
+          log: `⚠ ${modelName} gagal (${msg.slice(0, 90)}). Menunggu ${waitMs / 1000}d lalu fallback ke ${nextModel}…`,
+        });
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+      }
+    }
+  }
+
+  throw lastError || new Error('Seluruh percobaan model AI gagal.');
 }
 
 export async function POST(req: Request) {
@@ -216,12 +433,179 @@ export async function POST(req: Request) {
     const layoutStyle: VerbatimLayoutStyle = body?.layoutStyle === 'text-focused' ? 'text-focused' : 'varied';
     const handle = String(body?.handle ?? '@akunmedia').trim() || '@akunmedia';
     const useFallback = Boolean(body?.useFallback);
+    const wantsStream = Boolean(body?.stream);
 
     if (!prompt) {
       return NextResponse.json({ error: 'Prompt / teks berita wajib diisi.' }, { status: 400 });
     }
 
-    // Mode 1: Teks Asli (Tanpa Intervensi AI)
+    // Mode streaming real-time (NDJSON) untuk progress bar user & log presentasi dev
+    if (wantsStream) {
+      const encoder = new TextEncoder();
+      const t0 = Date.now();
+
+      const stream = new ReadableStream({
+        async start(controller) {
+          const send = (ev: GenerateStreamEvent) => {
+            controller.enqueue(encoder.encode(`${JSON.stringify(ev)}\n`));
+          };
+
+          try {
+            const words = prompt.split(/\s+/).filter(Boolean).length;
+            const paras = prompt.split(/\n+/).filter(p => p.trim()).length;
+            const { credits: detectedCredits } = extractArticleCredits(prompt);
+
+            send({
+              type: 'progress',
+              step: 'validate',
+              percent: 12,
+              elapsedMs: Date.now() - t0,
+              message: 'Memvalidasi naskah & mengekstrak kredit redaksi…',
+              log: `Naskah diterima: ${words} kata (${paras} paragraf). Kredit terdeteksi: ${
+                detectedCredits.length > 0
+                  ? detectedCredits.map(c => `${c.role} (${c.name})`).join(', ')
+                  : 'tidak ada baris kredit eksplisit'
+              }.`,
+            });
+
+            if (mode === 'verbatim') {
+              await new Promise(r => setTimeout(r, 120));
+              send({
+                type: 'progress',
+                step: 'connect',
+                percent: 42,
+                elapsedMs: Date.now() - t0,
+                message: 'Memecah paragraf verbatim tanpa mengubah kata…',
+                log: `Mode 1 (Verbatim 100%) aktif — gaya distribusi template: ${layoutStyle}.`,
+              });
+
+              const plan = buildVerbatimPlan(prompt, layoutStyle, handle);
+              await new Promise(r => setTimeout(r, 120));
+
+              send({
+                type: 'progress',
+                step: 'layout',
+                percent: 88,
+                elapsedMs: Date.now() - t0,
+                message: 'Memverifikasi kapasitas kanvas 1080×1350…',
+                log: `Teks asli berhasil dibagi ke 1 Cover + ${plan.slides.length} Slide Isi + 1 Penutup tanpa perubahan kata.`,
+              });
+
+              const durationMs = Date.now() - t0;
+              send({
+                type: 'progress',
+                step: 'done',
+                percent: 100,
+                elapsedMs: durationMs,
+                message: 'Layout selesai dibuat!',
+                log: `Proses selesai dalam ${(durationMs / 1000).toFixed(2)} detik.`,
+              });
+              send({ type: 'result', plan, source: 'verbatim', modelUsed: 'verbatim-engine', durationMs });
+              controller.close();
+              return;
+            }
+
+            if (useFallback) {
+              await new Promise(r => setTimeout(r, 120));
+              send({
+                type: 'progress',
+                step: 'connect',
+                percent: 45,
+                elapsedMs: Date.now() - t0,
+                message: 'Menjalankan simulasi perangkum lokal…',
+                log: 'Menggunakan mesin lokal (tanpa panggilan API eksternal).',
+              });
+
+              const plan = buildLocalAiPlan(prompt, context, handle, slideCount, wordCount);
+              await new Promise(r => setTimeout(r, 120));
+
+              const durationMs = Date.now() - t0;
+              send({
+                type: 'progress',
+                step: 'done',
+                percent: 100,
+                elapsedMs: durationMs,
+                message: 'Simulasi layout selesai!',
+                log: `Berhasil merakit 1 Cover + ${plan.slides.length} Slide Isi + 1 Penutup dalam ${(durationMs / 1000).toFixed(2)} detik.`,
+              });
+              send({ type: 'result', plan, source: 'fallback', modelUsed: 'local-fallback', durationMs });
+              controller.close();
+              return;
+            }
+
+            const apiKey = String(
+              process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+                process.env.GEMINI_API_KEY ||
+                process.env.GOOGLE_API_KEY ||
+                '',
+            ).trim();
+
+            if (!apiKey) {
+              send({
+                type: 'error',
+                error:
+                  'API Key belum dikonfigurasi. Tambahkan GOOGLE_GENERATIVE_AI_API_KEY di file .env.local lalu restart server.',
+                needsKey: true,
+                elapsedMs: Date.now() - t0,
+              });
+              controller.close();
+              return;
+            }
+
+            const { object: aiOut, modelUsed } = await tryStreamGenerate(
+              apiKey,
+              prompt,
+              slideCount,
+              wordCount,
+              context,
+              ev => send({ type: 'progress', elapsedMs: Date.now() - t0, ...ev }),
+            );
+
+            const { plan, upgradedCount, creditCount } = assemblePlanFromAi(aiOut, prompt, handle);
+            send({
+              type: 'progress',
+              step: 'layout',
+              percent: 95,
+              elapsedMs: Date.now() - t0,
+              message: 'Menyesuaikan kapasitas teks ke kanvas 1080×1350…',
+              log: `Validasi kanvas selesai: 1 Cover + ${plan.slides.length} Slide Isi + 1 Penutup · ${creditCount} kredit redaksi${
+                upgradedCount > 0 ? ` (${upgradedCount} slide otomatis disesuaikan templatenya agar tidak terpotong)` : ''
+              }.`,
+            });
+
+            const durationMs = Date.now() - t0;
+            send({
+              type: 'progress',
+              step: 'done',
+              percent: 100,
+              elapsedMs: durationMs,
+              message: 'Selesai! Membuka editor…',
+              log: `✓ Generasi tuntas via ${modelUsed} dalam ${(durationMs / 1000).toFixed(2)} detik.`,
+            });
+            send({ type: 'result', plan, source: 'gemini', modelUsed, durationMs });
+          } catch (error: unknown) {
+            const err = error as { message?: string };
+            send({
+              type: 'error',
+              error: formatFriendlyError(err?.message || 'Unknown error'),
+              elapsedMs: Date.now() - t0,
+            });
+          } finally {
+            controller.close();
+          }
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'application/x-ndjson; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          'X-Accel-Buffering': 'no',
+        },
+      });
+    }
+
+    // Jalur JSON non-stream (kompatibilitas cadangan)
     if (mode === 'verbatim') {
       return NextResponse.json({
         plan: buildVerbatimPlan(prompt, layoutStyle, handle),
@@ -229,7 +613,6 @@ export async function POST(req: Request) {
       });
     }
 
-    // Mode 2: Olah Penuh AI (Arsitektur original @ai-sdk/google + generateObject + zod)
     if (useFallback) {
       return NextResponse.json({
         plan: buildLocalAiPlan(prompt, context, handle, slideCount, wordCount),
@@ -254,60 +637,11 @@ export async function POST(req: Request) {
       );
     }
 
-    console.log('Starting AI generation with fallback models...');
-    const aiOut = await tryGenerate(apiKey, prompt, slideCount, wordCount, context);
-    console.log('AI Generation Complete!');
-
-    // Gabungkan kredit deterministik dari teks asli + hasil ekstraksi AI (tanpa halusinasi placeholder)
-    const { credits: parsedCredits } = extractArticleCredits(prompt);
-    const aiCredits = (aiOut.credits ?? [])
-      .map(c => ({ role: normalizeCreditRole(c.role), name: c.name.trim() }))
-      .filter(c => c.name && !/^(tim redaksi|meja berita|redaksi|dokumentasi)$/i.test(c.name));
-
-    const mergedCredits = [...parsedCredits];
-    for (const ac of aiCredits) {
-      if (!mergedCredits.some(c => c.role === ac.role && c.name.toLowerCase() === ac.name.toLowerCase())) {
-        mergedCredits.push(ac);
-      }
-    }
-
-    const plan: GeneratedCarouselPlan = {
-      cover: {
-        kicker: (aiOut.kicker || 'BERITA UTAMA').toUpperCase().slice(0, 26),
-        title: clampText(aiOut.cover, 72),
-        template: aiOut.coverTemplate,
-        credits: mergedCredits.slice(0, 4),
-      },
-      slides: aiOut.contents.map(item =>
-        ensureSlideFitsTemplate({
-          title: cleanBreak(item.title),
-          body: cleanBreak(item.body),
-          template: item.template,
-        }),
-      ),
-      penutup: {
-        title: clampText(aiOut.outroTitle || 'Baca Selengkapnya', 42),
-        body: clampText(aiOut.outro, 105),
-        handle,
-        template: aiOut.outroTemplate,
-      },
-    };
-
-    return NextResponse.json({ plan, source: 'gemini' });
+    const { object: aiOut, modelUsed } = await tryGenerate(apiKey, prompt, slideCount, wordCount, context);
+    const { plan } = assemblePlanFromAi(aiOut, prompt, handle);
+    return NextResponse.json({ plan, source: 'gemini', modelUsed });
   } catch (error: unknown) {
     const err = error as { message?: string };
-    console.error('=== AI GENERATION ERROR ===');
-    console.error('Error message:', err?.message);
-    console.error('=== END ERROR ===');
-
-    let userMessage = err?.message || 'Unknown error';
-
-    if (userMessage.includes('503') || userMessage.includes('high demand') || userMessage.includes('UNAVAILABLE')) {
-      userMessage = 'Server AI Google sedang sibuk (overload). Silakan tunggu 30 detik lalu coba lagi.';
-    } else if (userMessage.includes('401') || userMessage.includes('API key') || userMessage.includes('API_KEY_INVALID')) {
-      userMessage = 'API Key tidak valid. Periksa kembali file .env.local Anda.';
-    }
-
-    return NextResponse.json({ error: userMessage }, { status: 500 });
+    return NextResponse.json({ error: formatFriendlyError(err?.message || 'Unknown error') }, { status: 500 });
   }
 }
